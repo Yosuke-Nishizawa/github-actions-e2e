@@ -1,0 +1,113 @@
+name: E2E Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  # 手動実行のためのトリガーを追加
+  workflow_dispatch:
+    # 手動実行のためのトリガー（入力パラメータなし）
+
+jobs:
+  e2e-tests:
+    runs-on: ubuntu-latest
+    # パッケージ書き込み権限を付与
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      # リポジトリのコードをチェックアウト（ダウンロード）する
+      # このステップがないとワークフローはリポジトリのファイルにアクセスできない
+      - uses: actions/checkout@v4
+      
+      # DockerのBuildx機能をセットアップ
+      # マルチプラットフォームイメージのビルドや高度なキャッシュ機能を有効にする
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      # GitHub Container Registry (ghcr.io) にログイン
+      # これによりDockerイメージのキャッシュをプッシュおよびプルできるようになる
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      # リポジトリ名を小文字に変換（GitHub Container Registryの要件）
+      - name: Get lowercase repository name
+        id: repo-name
+        run: echo "repo=$(echo ${{ github.repository }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+      
+      # フロントエンドのDockerfileのハッシュ値を計算
+      # これを使ってDockerfileに変更があったかどうかを判断する
+      - name: Generate frontend Dockerfile hash
+        id: frontend-dockerfile-hash
+        run: echo "hash=$(md5sum frontend/Dockerfile | awk '{print $1}')" >> $GITHUB_OUTPUT
+      
+      # フロントエンドイメージをビルド（キャッシュを利用）
+      - name: Build frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: false
+          load: true
+          tags: frontend:latest
+          cache-from: type=registry,ref=ghcr.io/${{ steps.repo-name.outputs.repo }}/frontend:cache-${{ steps.frontend-dockerfile-hash.outputs.hash }}
+          cache-to: type=registry,ref=ghcr.io/${{ steps.repo-name.outputs.repo }}/frontend:cache-${{ steps.frontend-dockerfile-hash.outputs.hash }},mode=max
+      
+      # E2EテストのDockerfileのハッシュ値を計算
+      - name: Generate e2e Dockerfile hash
+        id: e2e-dockerfile-hash
+        run: echo "hash=$(md5sum e2e/Dockerfile | awk '{print $1}')" >> $GITHUB_OUTPUT
+      
+      # E2Eイメージをビルド（キャッシュを利用）
+      - name: Build e2e image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./e2e
+          push: false
+          load: true
+          tags: e2e:latest
+          cache-from: type=registry,ref=ghcr.io/${{ steps.repo-name.outputs.repo }}/e2e:cache-${{ steps.e2e-dockerfile-hash.outputs.hash }}
+          cache-to: type=registry,ref=ghcr.io/${{ steps.repo-name.outputs.repo }}/e2e:cache-${{ steps.e2e-dockerfile-hash.outputs.hash }},mode=max
+      
+      # docker-compose.ymlに定義されたサービスをバックグラウンドで起動
+      # -dフラグはデタッチドモード（バックグラウンド実行）を意味する
+      - name: Start services with Docker Compose
+        run: docker compose up -d
+      
+      # フロントエンドサービスが完全に起動するまで待機
+      # タイムアウト機能付きのポーリングループで健全性を確認
+      - name: Wait for frontend to be ready
+        run: |
+          timeout=60
+          while ! docker compose exec -T frontend wget -q --spider http://localhost:3000; do
+            if [ $timeout -le 0 ]; then
+              echo "Frontend service failed to start"
+              exit 1
+            fi
+            echo "Waiting for frontend service to be ready... ($timeout seconds left)"
+            timeout=$((timeout-5))
+            sleep 5
+          done
+      
+      # E2Eコンテナ内でPlaywrightテストを実行
+      # -Tフラグは疑似TTYの割り当てを無効にする（CIでの実行に必要）
+      - name: Run E2E tests
+        run: docker compose exec -T e2e npm test
+      
+      # テスト結果のレポートをGitHub Actionsのアーティファクトとして保存
+      # always()を使うことでテストが失敗した場合でもレポートを保存する
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: e2e/playwright-report
+          retention-days: 30 
+      - name: Shutdown services
+        if: always()
+        run: docker compose down
